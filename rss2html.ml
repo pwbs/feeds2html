@@ -7,7 +7,13 @@ open Syndic
 let planet_url = "/community/planet/"
 let planet_full_url = "http://ocaml.org/community/planet/"
 
-let planet_feeds_file = "planet_feeds.txt"
+let planet_feeds_file = ref ""
+let failsafe_flag = ref false
+let failsafe ~default f =
+  if !failsafe_flag then
+    try f () with _ -> default
+  else
+    f ()
 
 (* Utils
  ***********************************************************************)
@@ -120,7 +126,7 @@ let special_processing (e: Atom.entry) =
    is the reason for the failure.  Since these feed contain no
    entries, the aggregation will remove them. *)
 let broken_feed name url reason =
-  let feed = Atom.feed ~id:(Uri.of_string(Digest.to_hex(Digest.string name)))
+  let feed = Atom.feed ~id:((Digest.to_hex(Digest.string name)))
                        ~authors:[Atom.author name]
                        ~title:(Atom.Text reason)
                        ~updated:(CalendarLib.Calendar.now())
@@ -128,7 +134,27 @@ let broken_feed name url reason =
   (* See Syndic.Opml1.of_atom for the convention on the length. *)
   Atom.set_self_link feed url ~length:(-1)
 
+module Atom = struct
+  include Atom
+  let empty = {
+    authors = [];
+    categories = [];
+    contributors = [];
+    generator = None;
+    icon = None;
+    id = "empty" ;
+    links = [];
+    logo = None;
+    rights = None;
+    subtitle = None;
+    title = Text "";
+    updated = CalendarLib.Calendar.now();
+    entries = [];
+  }
+end
+
 let feed_of_url ~name url =
+  failsafe ~default:Atom.empty (fun () ->
   try
     let xml = `String(0, Http.get(Uri.to_string url)) in
     let feed =
@@ -151,6 +177,8 @@ let feed_of_url ~name url =
   | Nethttp_client.Http_error(err, _) ->
      let msg = Nethttp.(string_of_http_status (http_status_of_int err)) in
      broken_feed name url msg
+    )
+
 
 let planet_feeds =
   let add_feed acc line =
@@ -160,10 +188,28 @@ let planet_feeds =
       let url = String.sub line (i+1) (String.length line - i - 1) in
       feed_of_url ~name (Uri.of_string url) :: acc
     with Not_found -> acc in
-  lazy(List.fold_left add_feed [] (Utils.lines_of_file planet_feeds_file))
+  ref(
+    lazy(
+      if !planet_feeds_file <> "" then
+        List.fold_left add_feed [] (Utils.lines_of_file !planet_feeds_file)
+      else
+        []
+    )
+  )
+
+let add_feed name url =
+  failsafe
+    ~default:()
+    (fun () ->
+       let p = !planet_feeds in
+       planet_feeds := lazy (
+         feed_of_url ~name (Uri.of_string url) :: (Lazy.force p)
+       )
+    )
+
 
 let get_opml () =
-  let feeds = Lazy.force planet_feeds in
+  let feeds = Lazy.force !planet_feeds in
   let date_modified =
     List.fold_left (fun d f -> Date.max d f.Atom.updated) Date.epoch feeds in
   let head = Syndic.Opml1.head ~date_modified
@@ -198,7 +244,7 @@ let html_contributors () =
  ***********************************************************************)
 
 let digest_post (e: Atom.entry) =
-  Digest.to_hex (Digest.string (Uri.to_string e.Atom.id))
+  Digest.to_hex (Digest.string (e.Atom.id))
 
 let get_alternate_link (e: Atom.entry) =
   let open Atom in
@@ -498,7 +544,7 @@ let rec take n = function
   | e :: tl -> if n > 0 then e :: take (n-1) tl else []
 
 let aggregated_feed =
-  lazy(Atom.aggregate (Lazy.force planet_feeds)
+  lazy(Atom.aggregate (Lazy.force !planet_feeds)
                       ~sort:`Newest_first
                       ~title:(Atom.Text "OCaml Planet"))
 
@@ -576,80 +622,30 @@ let aggregate ?n fname =
   Atom.write (get_posts ?n ()) fname
 
 
-(* Email threads
- ***********************************************************************)
-
-(* The author is put at the end of the title: " - author name".
-   Beware that the name may contain "-" (assumed without spaces
-   around). *)
-let delete_author title =
-  let rec seek_dash pos =
-  try
-    let i = String.rindex_from title pos '-' in
-    if i > 0 && i < pos then
-      if title.[i-1] = ' ' && title.[i+1] = ' ' then
-        String.trim(String.sub title 0 i)
-      else (* maybe a correct dash before ? *)
-        seek_dash (i-1)
-    else title
-  with Not_found -> title in
-  seek_dash (String.length title - 1)
-
-(* Remove the "[Caml-list]" and possible "Re:". *)
-let caml_list_re =
-  Str.regexp_case_fold "^\\(Re: *\\)*\\(\\[[a-zA-Z0-9-]+\\] *\\)*"
-
-(** [email_threads] does basically the same as [headlines] but filter
-    the posts to have repeated subjects.  It also presents the subject
-    better. *)
-let email_threads ?n ~l9n url =
-  (* Do not use [n] yet because posts are filtered. *)
-  let posts = (feed_of_url ~name:"" url).Atom.entries in
-  let posts = List.sort Atom.descending posts in
-  let normalize_title (e: Atom.entry) =
-    let title = string_of_text_construct e.Atom.title in
-    let title = Str.replace_first caml_list_re "" title in
-    let title = delete_author title in
-    { e with Atom.title = Atom.Text title } in
-  let posts = List.map normalize_title posts in
-  (* Keep only the more recent post of redundant subjects. *)
-  let module S = Set.Make(String) in
-  let seen = ref S.empty in
-  let must_keep (e: Atom.entry) =
-    let title = string_of_text_construct e.Atom.title in
-    if S.mem title !seen then false
-    else (seen := S.add title !seen;  true) in
-  let posts = List.filter must_keep posts in
-  let posts = (match n with
-               | Some n -> take n posts
-               | None -> posts) in
-  let img = "/img/mail-icon" in
-  [Element("ul", ["class", "news-feed"],
-           List.concat(List.map (fun p -> headline_of_post ~l9n ~img p) posts))]
-
 
 (* Main
  ***********************************************************************)
 
 let () =
-  let url = ref "" in
   let action = ref `Posts in
   let n_posts = ref None in (* means unlimited *)
   let ofs_posts = ref 0 in
   let l9n = ref Netdate.posix_l9n in
   let specs = [
+    ("--feeds-list-file", Arg.String(fun s -> planet_feeds_file := s),
+     " Set the file that contains the list of feeds)");
+    ("--stdin", Arg.Unit(fun () -> planet_feeds_file := "/dev/stdin"),
+     " Set stdin as the file that contains the list of feeds)");
     ("--headlines", Arg.Unit(fun () -> action := `Headlines),
-     " RSS feed to feed summary (in HTML)");
-    ("--emails", Arg.Unit(fun () -> action := `Emails),
-     " RSS feed of email threads to HTML");
+     " Feeds to feed summary (in HTML)");
     ("--subscribers", Arg.Unit(fun () -> action := `Subscribers),
      " list of subscribers (rendered to HTML if alone)");
     ("--posts", Arg.Unit(fun () -> action := `Posts),
-     " RSS feed to HTML (default action)");
+     " Feeds to HTML (default action)");
     ("--list", Arg.Unit(fun () -> action := `List),
-     " RSS feed to a single HTML");
+     " Feeds to a single HTML");
     ("--nposts", Arg.Unit(fun () -> action := `NPosts),
-     " number of posts in the RSS feed");
+     " number of posts in the feed");
     ("--opml", Arg.String(fun fn -> action := `Opml fn),
      "fname write an OMPL document to the given file");
     ("--aggregate", Arg.String(fun fn -> action := `Aggregate fn),
@@ -660,28 +656,33 @@ let () =
      "n start at the n th post (first is numbered 0)");
     ("--locale",
      Arg.String(fun l -> l9n := Netdate.(l9n_from_locale l)),
-     "l Translate dates for the locale l")  ] in
-  let anon_arg s = url := s in
-  Arg.parse (Arg.align specs) anon_arg "rss2html <URL>";
-  let url = Uri.of_string !url in
+     "l Translate dates for the locale l");
+    ("--failsafe", Arg.Set(failsafe_flag),
+     " Activate failsafe mode");
+  ]
+  in
+  let anon_arg s =
+    add_feed s s
+  in
+  Arg.parse (Arg.align specs) anon_arg "RSS and Atom feeds to HTML";
   let l9n = Netdate.compile_l9n !l9n in
   let out = new Netchannels.output_channel stdout in
   (match !action with
    | `Headlines ->
-      Nethtml.write out (headlines ~planet:true ?n:!n_posts ~ofs:!ofs_posts
-                                   ~l9n ())
-   | `Emails -> Nethtml.write out (email_threads ?n:!n_posts ~l9n url)
+     Nethtml.write out (headlines ~planet:true ?n:!n_posts ~ofs:!ofs_posts
+                          ~l9n ())
    | `Posts -> Nethtml.write out (toggle_script
-                                 @ posts ?n:!n_posts ~ofs:!ofs_posts ())
+                                  @ posts ?n:!n_posts ~ofs:!ofs_posts ())
    | `List ->  Nethtml.write out (list_of_posts ?n:!n_posts ~ofs:!ofs_posts ())
    | `NPosts -> printf "%i" (nposts())
    | `Subscribers -> Nethtml.write out (html_contributors())
    | `Opml fn -> opml fn
    | `Aggregate fn -> aggregate fn ?n:!n_posts
   );
+  print_newline();
   out#close_out()
 
 
 (* Local Variables: *)
-(* compile-command: "make --no-print-directory -k -C .. script/rss2html" *)
+(* compile-command: "ocamlfind ocamlopt.opt -package netstring,nettls-gnutls,netclient,syndic -linkpkg utils.ml http.ml rss2html.ml -o rss" *)
 (* End: *)

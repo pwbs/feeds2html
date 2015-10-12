@@ -38,7 +38,7 @@ let relaxed_html40_dtd =
 let string_of_file fname =
   let buf = Buffer.create 4096 in
   let fh = open_in fname in
-  let s = String.create 1024 in
+  let s = Bytes.create 1024 in
   let n = ref 1 in (* enter the loop *)
   while !n > 0 do
     n := input fh s 0 1024;
