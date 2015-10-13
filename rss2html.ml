@@ -20,7 +20,15 @@ let failsafe ~default f =
 
 let unique (type x) (compare: x -> x -> int) l =
   let module S = Set.Make(struct type t = x let compare = compare end) in
-()
+  let rec loop s r = function
+    | [] -> r
+    | e::l ->
+      if S.mem e s then
+        loop s r l
+      else
+        loop (S.add e s) (e::r) l
+  in
+  loop S.empty [] l
 
 type html = Nethtml.document list
 
@@ -167,7 +175,11 @@ let feed_of_url ~name url =
         Rss2.parse ~xmlbase:url (Xmlm.make_input xml)
         |> Rss2.to_atom ~self:url in
     let feed = Atom.set_main_author feed (Atom.author name) in
-    { feed with Atom.entries = List.map special_processing feed.Atom.entries }
+    { feed
+      with
+        Atom.entries =
+          unique Pervasives.compare
+            (List.map special_processing feed.Atom.entries) }
   with
   | Rss2.Error.Error _ ->
       broken_feed name url "Neither an Atom nor a RSS2 feed"
@@ -558,7 +570,8 @@ let get_posts ?n ?(ofs=0) () =
   let entries = match n with
     | None -> entries
     | Some n -> take n entries in
-  { feed with Atom.entries = entries }
+  { feed with
+    Atom.entries = unique Pervasives.compare entries }
 
 let headlines ?n ?ofs ?planet ~l9n () =
   let posts = (get_posts ?n ?ofs ()).Atom.entries in
