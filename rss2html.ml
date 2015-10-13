@@ -18,6 +18,10 @@ let failsafe ~default f =
 (* Utils
  ***********************************************************************)
 
+let unique (type x) (compare: x -> x -> int) l =
+  let module S = Set.Make(struct type t = x let compare = compare end) in
+()
+
 type html = Nethtml.document list
 
 let encode_html =
@@ -126,7 +130,7 @@ let special_processing (e: Atom.entry) =
    is the reason for the failure.  Since these feed contain no
    entries, the aggregation will remove them. *)
 let broken_feed name url reason =
-  let feed = Atom.feed ~id:((Digest.to_hex(Digest.string name)))
+  let feed = Atom.feed ~id:(Uri.of_string(Digest.to_hex(Digest.string name)))
                        ~authors:[Atom.author name]
                        ~title:(Atom.Text reason)
                        ~updated:(CalendarLib.Calendar.now())
@@ -142,7 +146,7 @@ module Atom = struct
     contributors = [];
     generator = None;
     icon = None;
-    id = "empty" ;
+    id = Uri.of_string"empty" ;
     links = [];
     logo = None;
     rights = None;
@@ -244,7 +248,7 @@ let html_contributors () =
  ***********************************************************************)
 
 let digest_post (e: Atom.entry) =
-  Digest.to_hex (Digest.string (e.Atom.id))
+  Digest.to_hex (Digest.string (Uri.to_string(e.Atom.id)))
 
 let get_alternate_link (e: Atom.entry) =
   let open Atom in
