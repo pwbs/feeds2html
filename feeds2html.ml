@@ -1,22 +1,23 @@
-(** Render an RSS feed to HTML, for the headlines or the actual posts. *)
-
+(** Get RSS/Atom feeds and convert them to HTML *)
 open Printf
 open Nethtml
 open Syndic
 
-let planet_url = "/community/planet/"
-let planet_full_url = "http://ocaml.org/community/planet/"
+let planet_url = ref ""
+let planet_full_url = ref ""
 
 let planet_feeds_file = ref ""
+
+(* Utils
+ ***********************************************************************)
+
 let failsafe_flag = ref false
+
 let failsafe ~default f =
   if !failsafe_flag then
     try f () with _ -> default
   else
     f ()
-
-(* Utils
- ***********************************************************************)
 
 let unique (type x) (compare: x -> x -> int) l =
   let module S = Set.Make(struct type t = x let compare = compare end) in
@@ -29,6 +30,31 @@ let unique (type x) (compare: x -> x -> int) l =
         loop (S.add e s) (e::r) l
   in
   loop S.empty [] l
+
+
+let unique_most_recent_entries l =
+  let module S =
+    Set.Make(
+    struct
+      type t = Atom.entry
+      let compare (a:t) (b:t) =
+        Pervasives.compare a.Atom.id b.Atom.id
+    end)
+  in
+  let rec loop s = function
+    | [] ->
+      List.filter (fun e -> S.mem e s) l
+    | hd::tl ->
+      match S.find hd s with
+      | x ->
+        (match Syndic_date.compare hd.Atom.updated x.Atom.updated with
+         | n when n > 0 -> loop (S.add hd s) tl
+         | _            -> loop s l)
+      | exception Not_found ->
+        loop (S.add hd s) tl
+  in
+  loop S.empty l
+
 
 type html = Nethtml.document list
 
@@ -219,7 +245,9 @@ let add_feed name url =
     (fun () ->
        let p = !planet_feeds in
        planet_feeds := lazy (
-         feed_of_url ~name (Uri.of_string url) :: (Lazy.force p)
+         let p = Lazy.force p in
+         failsafe ~default:p
+           (fun () -> feed_of_url ~name (Uri.of_string url) :: p)
        )
     )
 
@@ -427,7 +455,7 @@ let html_of_post e =
        let a_args = ["href", url_orig; "target", "_blank";
                      "title", "Go to the original post"] in
        let post =
-         Netencoding.Url.encode (planet_full_url ^ "#" ^ title_anchor) in
+         Netencoding.Url.encode (!planet_full_url ^ "#" ^ title_anchor) in
        let google = ["href", "https://plus.google.com/share?url="
                              ^ (Netencoding.Url.encode url_orig);
                      "target", "_blank"; "title", "Share on Google+"] in
@@ -519,7 +547,7 @@ let netdate_of_calendar d =
    news (only titles are shown, linked to the page with the full story). *)
 let headline_of_post ?(planet=false) ?(img_alt="") ~l9n ~img e =
   let link =
-    if planet then planet_url ^ "#" ^ digest_post e
+    if planet then !planet_url ^ "#" ^ digest_post e
     else match get_alternate_link e with
          | Some l -> Uri.to_string l
          | None -> "" in
@@ -571,7 +599,11 @@ let get_posts ?n ?(ofs=0) () =
     | None -> entries
     | Some n -> take n entries in
   { feed with
-    Atom.entries = unique Pervasives.compare entries }
+    Atom.entries =
+      unique
+        (fun (a:Atom.entry) (b:Atom.entry) ->
+           compare a.Syndic_atom.id b.Syndic_atom.id)
+        entries }
 
 let headlines ?n ?ofs ?planet ~l9n () =
   let posts = (get_posts ?n ?ofs ()).Atom.entries in
@@ -639,7 +671,6 @@ let aggregate ?n fname =
   Atom.write (get_posts ?n ()) fname
 
 
-
 (* Main
  ***********************************************************************)
 
@@ -698,6 +729,8 @@ let () =
   );
   print_newline();
   out#close_out()
+
+
 
 
 (* Local Variables: *)
